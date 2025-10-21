@@ -21,6 +21,7 @@ class BuildState implements BuildStateInterface
         protected bool $force_fresh_downloads = false,
         protected bool $skip_errors = false,
         protected bool $no_interaction = false,
+        protected bool $fix_checksums = false,
     ) {
         $this->placeholders = collect();
         $this->crc = collect();
@@ -127,6 +128,18 @@ class BuildState implements BuildStateInterface
     public function setNoInteraction(bool $no_interaction): BuildState
     {
         $this->no_interaction = $no_interaction;
+
+        return $this;
+    }
+
+    public function isFixChecksums(): bool
+    {
+        return $this->fix_checksums;
+    }
+
+    public function setFixChecksums(bool $fix_checksums): BuildState
+    {
+        $this->fix_checksums = $fix_checksums;
 
         return $this;
     }

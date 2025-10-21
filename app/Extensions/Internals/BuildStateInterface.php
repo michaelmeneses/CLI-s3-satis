@@ -36,6 +36,10 @@ interface BuildStateInterface
 
     public function setNoInteraction(bool $no_interaction): BuildState;
 
+    public function isFixChecksums(): bool;
+
+    public function setFixChecksums(bool $fix_checksums): BuildState;
+
     public function isLastStepSkipped(): bool;
 
     public function getConfig(): Collection;

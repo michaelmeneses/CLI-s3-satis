@@ -28,6 +28,7 @@ class BuildCommand extends Command
         {--set-extension=* : Configures the build to use the given extension(s).}
         {--skip-errors : Skip Download or Archive errors }
         {--no-interaction-s3 : Do not ask any interactive question }
+        {--fix-checksums : Fix package checksums (may perform remote reads)}
     ';
 
     /**
@@ -55,7 +56,8 @@ class BuildCommand extends Command
             repository_urls: $this->option('repository-url'),
             force_fresh_downloads: $this->option('fresh'),
             skip_errors: $this->option('skip-errors'),
-            no_interaction: $this->option('no-interaction-s3')
+            no_interaction: $this->option('no-interaction-s3'),
+            fix_checksums: $this->option('fix-checksums')
         );
 
         $extensionRunner->enableExtensionFromBuildState($this, $buildConfig);
