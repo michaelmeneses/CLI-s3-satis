@@ -92,15 +92,22 @@ class CacheExtension
                     'cache_path' => $path->append($work_name),
                 ];
             })
-            ->each(function (array $file) use ($command) {
+            ->each(function (array $file) use ($config, $command) {
                 $directory = dirname($file['cache_path']);
                 if (! is_dir($directory) && ! mkdir($directory, recursive: true)) {
                     throw new \Exception("Unable to create directory {$directory}.");
                 }
 
                 if (str($file['file'])->endsWith(['.zip', '.tar'])) {
-                    $command->line("Skipping caching {$file['file']} - placeholder was created instead.", verbosity: OutputInterface::VERBOSITY_DEBUG);
-                    touch($file['cache_path']);
+                    if (! $config->get('cache_archives', true)) {
+                        $command->line("Skipping caching {$file['file']} - placeholder was created instead.", verbosity: OutputInterface::VERBOSITY_DEBUG);
+                        touch($file['cache_path']);
+
+                        return;
+                    }
+
+                    $command->line("Caching archive {$file['file']}.", verbosity: OutputInterface::VERBOSITY_DEBUG);
+                    copy($file['path'], $file['cache_path']);
 
                     return;
                 }
