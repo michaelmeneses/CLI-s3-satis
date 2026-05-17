@@ -39,15 +39,30 @@ for configuration options.
 }
 ```
 
-Second, configure your environment variables (or `.env` file) with your S3 bucket credentials:
-```env
-S3_ACCESS_KEY_ID=
-S3_SECRET_ACCESS_KEY=
-S3_REGION=us-east-1
-S3_BUCKET=
-S3_ENDPOINT=
-S3_USE_PATH_STYLE_ENDPOINT=false
+Second, configure your environment variables. Three options:
+
+**Opção A — Manual:**
+```bash
+cp .env.example .env
+# Edite .env com suas credenciais
 ```
+
+**Opção B — 1Password com `op run` (recomendado):**
+```bash
+op run --env-file=.env.example -- s3-satis build satis.json
+```
+
+**Opção C — 1Password com `op inject`:**
+```bash
+op inject -i .env.production.tpl -o .env
+```
+
+| Arquivo | Descrição |
+|---------|-----------|
+| `.env.example` | Template com refs `op://` para uso com `op run` |
+| `.env.production.tpl` | Template com `{{ op:// }}` para uso com `op inject` |
+
+Credenciais armazenadas no 1Password (vault `DEV-LEGACY`, item `cli-s3-satis`).
 
 Then run `s3-satis` tool to generate repository and upload it to S3 bucket:
 ```bash
