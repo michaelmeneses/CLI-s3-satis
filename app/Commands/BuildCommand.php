@@ -94,7 +94,7 @@ class BuildCommand extends Command
         if ($buildConfig->last_step_executed = $extensionRunner->execute($this, BuildHooks::BEFORE_DOWNLOAD_FROM_S3, $buildConfig)) {
             if (! $buildConfig->isForceFreshDownloads()) {
                 $this->info('Downloading from S3');
-                [$placeholders, $crc] = $this->downloadFromS3(prefix: $buildConfig->getTempPrefix());
+                [$placeholders, $crc] = $this->downloadFromS3(prefix: $buildConfig->getTempPrefix(), skipErrors: $buildConfig->isSkipErrors());
                 $buildConfig->setPlaceholders(
                     placeholders: $placeholders
                 );
@@ -128,7 +128,8 @@ class BuildCommand extends Command
             $this->uploadToS3(
                 prefix: $buildConfig->getTempPrefix(),
                 placeholders: $buildConfig->getPlaceholders(),
-                crc: $buildConfig->getCrc()
+                crc: $buildConfig->getCrc(),
+                skipErrors: $buildConfig->isSkipErrors()
             );
         } else {
             $this->info('Skipping uploading to S3');
@@ -181,28 +182,111 @@ class BuildCommand extends Command
     }
 
     /**
-     * Download (or make placeholders) the files from S3
+     * Build a standalone S3Client from the same config as the 's3' disk.
+     * Used instead of reaching into Flysystem internals so CommandPool can
+     * issue concurrent requests directly against the AWS SDK.
      */
-    protected function downloadFromS3(string $prefix): array
+    protected function getS3Client(): \Aws\S3\S3Client
+    {
+        $config = config('filesystems.disks.s3');
+
+        return new \Aws\S3\S3Client([
+            'version' => 'latest',
+            'region' => $config['region'],
+            'endpoint' => $config['endpoint'],
+            'use_path_style_endpoint' => $config['use_path_style_endpoint'] ?? false,
+            'credentials' => [
+                'key' => $config['key'],
+                'secret' => $config['secret'],
+            ],
+            'http' => $config['http'] ?? [],
+            'retries' => $config['retries'] ?? 3,
+        ]);
+    }
+
+    /**
+     * Download (or make placeholders) the files from S3.
+     *
+     * zip/tar archives get an instant 0-byte placeholder (unchanged -- the
+     * archive builder only checks local file existence, never content).
+     * Everything else (checksums, p2 json, packages.json) is downloaded
+     * concurrently via Aws\CommandPool instead of one-by-one: with a cold
+     * cache this set is ~28k small objects, and a strictly sequential loop
+     * with no per-request timeout is what turns a cold build into a 1.5-2h
+     * run (or an indefinite hang on a single stalled connection).
+     */
+    protected function downloadFromS3(string $prefix, bool $skipErrors = false): array
     {
         $placeholders = collect();
         $crc = collect();
 
-        collect(Storage::disk('s3')->allFiles())
-            ->map(fn ($file) => str($file))->each(function (Stringable $s3_path) use ($prefix, $placeholders, $crc) {
+        $allFiles = collect(Storage::disk('s3')->allFiles())->map(fn ($file) => str($file));
+        $this->info("Found {$allFiles->count()} files in S3");
+
+        [$archiveFiles, $otherFiles] = $allFiles->partition(
+            fn (Stringable $s3_path) => in_array($s3_path->afterLast('.'), ['tar', 'zip'])
+        );
+
+        $archiveFiles->each(function (Stringable $s3_path) use ($prefix, $placeholders) {
+            $temp_path = $s3_path->start('/')->start($prefix);
+
+            $this->line("Creating placeholder {$s3_path} in temp directory", verbosity: OutputInterface::VERBOSITY_VERBOSE);
+            $placeholders->push($temp_path->toString());
+            Storage::disk('temp')->put($temp_path, '');
+        });
+
+        $otherFiles = $otherFiles->values();
+        $total = $otherFiles->count();
+        if ($total === 0) {
+            return [$placeholders, $crc];
+        }
+
+        $client = $this->getS3Client();
+        $bucket = config('filesystems.disks.s3.bucket');
+        $concurrency = (int) env('S3_DOWNLOAD_CONCURRENCY', 20);
+        $heartbeat = max(50, (int) ($total / 20));
+
+        $this->info("Downloading {$total} non-archive files from S3 (concurrency: {$concurrency})");
+
+        $done = 0;
+        $failed = collect();
+        $commands = $otherFiles->map(fn (Stringable $s3_path) => $client->getCommand('GetObject', [
+            'Bucket' => $bucket,
+            'Key' => (string) $s3_path,
+        ]));
+
+        (new \Aws\CommandPool($client, $commands->all(), [
+            'concurrency' => $concurrency,
+            'fulfilled' => function ($result, $index) use (&$done, $otherFiles, $prefix, $crc, $total, $heartbeat) {
+                $s3_path = $otherFiles[$index];
                 $temp_path = $s3_path->start('/')->start($prefix);
+                $body = (string) $result['Body'];
 
-                if ($s3_path->afterLast('.') == 'tar' || $s3_path->afterLast('.') == 'zip') {
-                    $placeholders->push($temp_path->toString());
+                $this->line("Downloading {$s3_path} from S3", verbosity: OutputInterface::VERBOSITY_VERBOSE);
+                Storage::disk('temp')->put($temp_path, $body);
+                $crc[$temp_path->toString()] = crc32($body);
 
-                    $this->line("Creating placeholder {$s3_path} in temp directory", verbosity: OutputInterface::VERBOSITY_VERBOSE);
-                    Storage::disk('temp')->put($temp_path, '');
-                } else {
-                    $this->line("Downloading {$s3_path} from S3", verbosity: OutputInterface::VERBOSITY_VERBOSE);
-                    Storage::disk('temp')->writeStream($temp_path, Storage::disk('s3')->readStream($s3_path));
-                    $crc[$temp_path->toString()] = crc32(Storage::disk('temp')->get($temp_path));
+                $done++;
+                if ($done % $heartbeat === 0 || $done === $total) {
+                    $this->info("Downloaded {$done}/{$total} files from S3");
                 }
-            });
+            },
+            'rejected' => function ($reason, $index) use (&$failed, $otherFiles, $skipErrors) {
+                $s3_path = $otherFiles[$index];
+                $message = $reason instanceof \Throwable ? $reason->getMessage() : (string) $reason;
+
+                if (! $skipErrors) {
+                    throw new \RuntimeException("Failed downloading {$s3_path} from S3: {$message}");
+                }
+
+                $this->warn("Skipping {$s3_path} after download failure: {$message}");
+                $failed->push((string) $s3_path);
+            },
+        ]))->promise()->wait();
+
+        if ($failed->isNotEmpty()) {
+            $this->warn("{$failed->count()} file(s) failed to download from S3 and were skipped (--skip-errors).");
+        }
 
         return [$placeholders, $crc];
     }
@@ -247,42 +331,99 @@ class BuildCommand extends Command
     }
 
     /**
-     * Upload the generated files to S3
+     * Upload the generated files to S3.
+     *
+     * Placeholder files (real content already lives at that key on S3
+     * unchanged, or the placeholder is empty and nothing to upload) are
+     * handled sequentially -- cheap, local-only checks. Everything that
+     * actually needs a PutObject is batched through the same concurrent
+     * CommandPool pattern as downloadFromS3, for the same reason: this loop
+     * touches every file in the build (tens of thousands on a cold cache).
      */
-    protected function uploadToS3(int $prefix, Collection $placeholders, Collection $crc): void
+    protected function uploadToS3(int $prefix, Collection $placeholders, Collection $crc, bool $skipErrors = false): void
     {
-        collect(Storage::disk('temp')->allFiles($prefix))
-            ->map(fn ($file) => str($file))
-            ->tap(function (Collection $files) use ($prefix, $placeholders, $crc) {
-                [$placeholder_files, $normal_files] = $files->partition(fn (Stringable $file) => $placeholders->contains($file->toString()));
+        $files = collect(Storage::disk('temp')->allFiles($prefix))->map(fn ($file) => str($file));
+        [$placeholder_files, $normal_files] = $files->partition(fn (Stringable $file) => $placeholders->contains($file->toString()));
 
-                $placeholder_files->each(function (Stringable $temp_path) use ($prefix) {
-                    $s3_path = $temp_path->after($prefix)->ltrim('/');
+        $toUpload = collect();
 
-                    if (Storage::disk('temp')->size($temp_path) > 0) {
-                        $this->line("Uploading {$s3_path} to S3", verbosity: OutputInterface::VERBOSITY_VERBOSE);
-                        Storage::disk('s3')->writeStream($s3_path, Storage::disk('temp')->readStream($temp_path));
-                    } else {
-                        $this->line("Skipping {$s3_path} because it is a placeholder", verbosity: OutputInterface::VERBOSITY_VERBOSE);
-                    }
-                });
+        $placeholder_files->each(function (Stringable $temp_path) use ($prefix, $toUpload) {
+            $s3_path = $temp_path->after($prefix)->ltrim('/');
 
-                $normal_files->each(function (Stringable $temp_path) use ($crc, $prefix) {
-                    $s3_path = $temp_path->after($prefix)->ltrim('/');
+            if (Storage::disk('temp')->size($temp_path) > 0) {
+                $toUpload->push([$s3_path, $temp_path]);
+            } else {
+                $this->line("Skipping {$s3_path} because it is a placeholder", verbosity: OutputInterface::VERBOSITY_VERBOSE);
+            }
+        });
 
-                    if ($crc->has($temp_path->toString())) {
-                        $this->line("Checking {$s3_path} for changes", verbosity: OutputInterface::VERBOSITY_VERBOSE);
-                        $local_crc = crc32(Storage::disk('temp')->get($temp_path));
-                        if ($crc[$temp_path->toString()] == $local_crc) {
-                            $this->line("Skipping {$s3_path} because it has not changed", verbosity: OutputInterface::VERBOSITY_VERBOSE);
+        $normal_files->each(function (Stringable $temp_path) use ($crc, $prefix, $toUpload) {
+            $s3_path = $temp_path->after($prefix)->ltrim('/');
 
-                            return;
-                        }
-                    }
+            if ($crc->has($temp_path->toString())) {
+                $this->line("Checking {$s3_path} for changes", verbosity: OutputInterface::VERBOSITY_VERBOSE);
+                $local_crc = crc32(Storage::disk('temp')->get($temp_path));
+                if ($crc[$temp_path->toString()] == $local_crc) {
+                    $this->line("Skipping {$s3_path} because it has not changed", verbosity: OutputInterface::VERBOSITY_VERBOSE);
 
-                    $this->line("Uploading {$s3_path} to S3", verbosity: OutputInterface::VERBOSITY_VERBOSE);
-                    Storage::disk('s3')->writeStream($s3_path, Storage::disk('temp')->readStream($temp_path));
-                });
-            });
+                    return;
+                }
+            }
+
+            $toUpload->push([$s3_path, $temp_path]);
+        });
+
+        $toUpload = $toUpload->values();
+        $total = $toUpload->count();
+        if ($total === 0) {
+            return;
+        }
+
+        $client = $this->getS3Client();
+        $bucket = config('filesystems.disks.s3.bucket');
+        $concurrency = (int) env('S3_UPLOAD_CONCURRENCY', 20);
+        $heartbeat = max(50, (int) ($total / 20));
+
+        $this->info("Uploading {$total} files to S3 (concurrency: {$concurrency})");
+
+        $done = 0;
+        $failed = collect();
+        $commands = $toUpload->map(function (array $pair) use ($client, $bucket) {
+            [$s3_path, $temp_path] = $pair;
+
+            return $client->getCommand('PutObject', [
+                'Bucket' => $bucket,
+                'Key' => (string) $s3_path,
+                'Body' => Storage::disk('temp')->readStream($temp_path),
+            ]);
+        });
+
+        (new \Aws\CommandPool($client, $commands->all(), [
+            'concurrency' => $concurrency,
+            'fulfilled' => function ($result, $index) use (&$done, $toUpload, $total, $heartbeat) {
+                [$s3_path] = $toUpload[$index];
+                $this->line("Uploading {$s3_path} to S3", verbosity: OutputInterface::VERBOSITY_VERBOSE);
+
+                $done++;
+                if ($done % $heartbeat === 0 || $done === $total) {
+                    $this->info("Uploaded {$done}/{$total} files to S3");
+                }
+            },
+            'rejected' => function ($reason, $index) use (&$failed, $toUpload, $skipErrors) {
+                [$s3_path] = $toUpload[$index];
+                $message = $reason instanceof \Throwable ? $reason->getMessage() : (string) $reason;
+
+                if (! $skipErrors) {
+                    throw new \RuntimeException("Failed uploading {$s3_path} to S3: {$message}");
+                }
+
+                $this->warn("Skipping {$s3_path} after upload failure: {$message}");
+                $failed->push((string) $s3_path);
+            },
+        ]))->promise()->wait();
+
+        if ($failed->isNotEmpty()) {
+            $this->warn("{$failed->count()} file(s) failed to upload to S3 and were skipped (--skip-errors).");
+        }
     }
 }
