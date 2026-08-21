@@ -299,7 +299,7 @@ class BuildCommand extends Command
         $application = new Application();
         $application->setAutoExit(false); // prevent `$application->run` method from exitting the script
 
-        $application->run(
+        $exitCode = $application->run(
             new ArrayInput(
                 [
                     'command' => 'build',
@@ -310,6 +310,16 @@ class BuildCommand extends Command
                 + ($no_interaction ? ['--no-interaction' => true] : [])
             )
         );
+
+        // $application->run()'s return value was previously discarded, so a
+        // crashed composer/satis `build` command (uncaught exception -- e.g.
+        // a git ownership/permissions error hit while inspecting a VCS
+        // package source) silently produced NO updated packages.json/dist
+        // output while this command, and the CI job around it, still
+        // reported success. Fail loudly instead.
+        if ($exitCode !== 0) {
+            throw new \RuntimeException("composer/satis 'build' command failed with exit code {$exitCode} -- packages.json and dist archives were NOT regenerated. See the output above for the underlying error.");
+        }
     }
 
     /**
